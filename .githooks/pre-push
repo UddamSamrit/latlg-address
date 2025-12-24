@@ -4,41 +4,58 @@
 
 set -e
 
-echo "Running pre-push verification..."
+# Force output to be visible (no buffering)
+exec 1>&2
+
+echo ""
+echo "=========================================="
+echo "🔍 Running pre-push verification..."
+echo "=========================================="
+echo ""
 
 # Check if Go is installed
 if ! command -v go &> /dev/null; then
-    echo "Error: Go is not installed or not in PATH"
+    echo "❌ Error: Go is not installed or not in PATH"
     exit 1
 fi
 
 # Run go fmt to check formatting
-echo "Checking code formatting..."
+echo ""
+echo "📝 Checking code formatting (go fmt)..."
 if ! go fmt ./...; then
-    echo "Error: Code formatting failed"
+    echo "❌ Error: Code formatting failed"
     exit 1
 fi
+echo "✓ Formatting OK"
 
 # Run go vet to check for errors
-echo "Running go vet..."
-if ! go vet ./...; then
-    echo "Error: go vet found issues"
+echo ""
+echo "🔎 Running static analysis (go vet)..."
+if ! go vet ./... 2>&1; then
+    echo "❌ Error: go vet found issues"
     exit 1
 fi
+echo "✓ Static analysis OK"
 
 # Check if code compiles
-echo "Verifying code compiles..."
-if ! go build ./...; then
-    echo "Error: Code does not compile"
+echo ""
+echo "🔨 Verifying code compiles..."
+if ! go build ./... 2>&1; then
+    echo "❌ Error: Code does not compile"
     exit 1
 fi
+echo "✓ Compilation OK"
 
-# Check for uncommitted changes (optional)
+# Check for uncommitted changes (optional - just warning)
 if [ -n "$(git status --porcelain)" ]; then
-    echo "Warning: You have uncommitted changes"
-    echo "Consider committing or stashing them before pushing"
+    echo ""
+    echo "⚠️  Warning: You have uncommitted changes"
+    echo "   Consider committing or stashing them before pushing"
 fi
 
-echo "✓ Pre-push verification passed!"
+echo ""
+echo "=========================================="
+echo "✅ Pre-push verification passed!"
+echo "=========================================="
 exit 0
 

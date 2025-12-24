@@ -235,6 +235,33 @@ git commit --no-verify -m "your message"
 - Ensure code compiles: `go build ./...`
 - Check for large files that might need Git LFS
 
+## 100% Setup Verification
+
+To ensure everything is set up correctly, run these verification commands:
+
+```bash
+# Check code formatting
+go fmt ./...
+
+# Check for issues
+go vet ./...
+
+# Build the project
+go build ./...
+
+# Verify pre-commit hook is installed
+ls -la .git/hooks/pre-commit
+
+# Test the hook (make a small change and commit)
+echo "test" >> test.txt
+git add test.txt
+git commit -m "test"  # Hook should run automatically
+git reset HEAD~1      # Undo test commit
+rm test.txt          # Clean up
+```
+
+All commands should pass without errors.
+
 ## API Information
 
 This program uses the OpenStreetMap Nominatim reverse geocoding API, which is free and doesn't require an API key. However, please be respectful of their service:

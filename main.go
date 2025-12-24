@@ -434,15 +434,25 @@ func (s *Service) formatFullAddress(resp GeocodeResponse) string {
 func (s *Service) extractDistrictAndProvince(resp GeocodeResponse) (district, province string) {
 	addr := resp.Address
 
-	// Extract district (in English)
+	// Extract district (in English) - try multiple fallbacks
+	// For Cambodia, district might be in different fields
 	if addr.District != "" {
 		district = addr.District
 	} else if addr.County != "" {
 		district = addr.County
 	} else if addr.StateDistrict != "" {
 		district = addr.StateDistrict
+	} else if addr.Subdistrict != "" {
+		district = addr.Subdistrict
+	} else if addr.Suburb != "" {
+		district = addr.Suburb
+	} else if addr.City != "" && addr.Province == "" {
+		// Use city as district if province is separate
+		district = addr.City
+	} else {
+		// Try to extract from display_name if available
+		district = s.extractDistrictFromDisplayName(resp.DisplayName, resp)
 	}
-	// If district not found, leave it empty (simple handling)
 
 	// Extract province/state (in English)
 	if addr.Province != "" {
@@ -455,9 +465,34 @@ func (s *Service) extractDistrictAndProvince(resp GeocodeResponse) (district, pr
 		// Fallback to country if province not found
 		province = addr.Country
 	}
-	// If province not found, leave it empty (simple handling)
 
 	return district, province
+}
+
+// extractDistrictFromDisplayName tries to extract district from the display name
+func (s *Service) extractDistrictFromDisplayName(displayName string, addr GeocodeResponse) string {
+	// For Cambodia addresses, the structure might be: Road, Subdistrict, District, Province, Country
+	// Try to parse common patterns
+	parts := strings.Split(displayName, ",")
+
+	// If we have multiple parts, district might be in the middle
+	// Common pattern: [road], [subdistrict], [district], [province], [country]
+	if len(parts) >= 3 {
+		// District is usually the third part from the end (before province and country)
+		// Or second part if there's no subdistrict
+		for i := len(parts) - 3; i >= 0 && i < len(parts)-1; i-- {
+			part := strings.TrimSpace(parts[i])
+			// Skip if it's a number (postcode) or known non-district fields
+			if part != "" && part != addr.Address.Province &&
+				part != addr.Address.Country &&
+				part != addr.Address.City && part != addr.Address.State {
+				// This might be the district
+				return part
+			}
+		}
+	}
+
+	return ""
 }
 
 func main() {

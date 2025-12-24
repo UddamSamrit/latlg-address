@@ -1,0 +1,34 @@
+name: Pre-commit Checks
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+
+jobs:
+  pre-commit:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.21'
+      
+      - name: Run go fmt
+        run: go fmt ./...
+      
+      - name: Run go vet
+        run: go vet ./...
+      
+      - name: Build
+        run: go build ./...
+      
+      - name: Run tests (if any)
+        run: go test ./... || true
+

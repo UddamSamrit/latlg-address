@@ -1,0 +1,61 @@
+#!/bin/bash
+
+# Pre-commit hook to check code quality before committing
+
+set -e
+
+echo "Running pre-commit checks..."
+
+# Check if Go is installed
+if ! command -v go &> /dev/null; then
+    echo "Error: Go is not installed or not in PATH"
+    exit 1
+fi
+
+# Run go fmt to check formatting
+echo "Checking code formatting..."
+if ! go fmt ./...; then
+    echo "Error: Code formatting failed"
+    exit 1
+fi
+
+# Run go vet to check for errors
+echo "Running go vet..."
+if ! go vet ./...; then
+    echo "Error: go vet found issues"
+    exit 1
+fi
+
+# Check if code compiles
+echo "Checking if code compiles..."
+if ! go build ./...; then
+    echo "Error: Code does not compile"
+    exit 1
+fi
+
+# Check for large files
+echo "Checking for large files..."
+MAX_FILE_SIZE=10485760  # 10MB
+large_files=$(find . -type f -size +${MAX_FILE_SIZE} -not -path "./.git/*" -not -path "./data/*")
+if [ -n "$large_files" ]; then
+    echo "Warning: Large files detected:"
+    echo "$large_files"
+    echo "Consider using Git LFS for large files"
+fi
+
+# Check for common issues
+echo "Checking for common issues..."
+
+# Check for TODO/FIXME comments in main.go (optional - can be removed)
+if grep -r "TODO\|FIXME" main.go 2>/dev/null; then
+    echo "Warning: TODO/FIXME comments found in main.go"
+fi
+
+# Check for hardcoded credentials (basic check)
+if grep -r "password\|secret\|api_key" --include="*.go" . 2>/dev/null | grep -v "//.*password\|//.*secret"; then
+    echo "Warning: Potential hardcoded credentials found"
+fi
+
+echo "Pre-commit checks passed!"
+exit 0
+

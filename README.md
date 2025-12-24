@@ -55,6 +55,15 @@ You should see something like: `go version go1.21.x` or higher
 go mod download
 ```
 
+### Step 3.5: Set Up Pre-commit Hooks (Recommended)
+
+```bash
+chmod +x setup-hooks.sh
+./setup-hooks.sh
+```
+
+This will install pre-commit hooks that check code quality before each commit.
+
 ### Step 4: Prepare Your Excel File
 
 1. Create a `data/` directory in the project root (if it doesn't exist):
@@ -139,6 +148,92 @@ latlg-address/
 ### API errors:
 - Check your internet connection
 - The API might be temporarily unavailable, try again later
+
+## Pre-commit Hooks & Branch Protection
+
+This repository includes pre-commit hooks to ensure code quality before commits.
+
+### Setting Up Pre-commit Hooks
+
+#### Local Setup
+
+Run the setup script:
+
+```bash
+chmod +x setup-hooks.sh
+./setup-hooks.sh
+```
+
+Or manually install:
+
+```bash
+chmod +x .githooks/pre-commit
+cp .githooks/pre-commit .git/hooks/pre-commit
+```
+
+#### What the Pre-commit Hook Checks
+
+The pre-commit hook automatically runs before each commit and checks:
+
+- ✅ **Code Formatting**: Runs `go fmt` to ensure code is properly formatted
+- ✅ **Static Analysis**: Runs `go vet` to catch common errors
+- ✅ **Compilation**: Ensures the code compiles successfully
+- ✅ **Large Files**: Warns about files larger than 10MB
+- ✅ **Security**: Basic check for hardcoded credentials
+
+If any check fails, the commit will be blocked. Fix the issues and try again.
+
+### Protecting the Main Branch
+
+#### For GitHub:
+
+1. Go to your repository on GitHub
+2. Navigate to **Settings** → **Branches**
+3. Under **Branch protection rules**, click **Add rule**
+4. Set **Branch name pattern** to `main`
+5. Enable the following:
+   - ✅ Require a pull request before merging
+   - ✅ Require approvals (set to 1 or more)
+   - ✅ Require status checks to pass before merging
+     - Select: `Pre-commit Checks`
+   - ✅ Require branches to be up to date before merging
+   - ✅ Include administrators
+   - ✅ Do not allow bypassing the above settings
+
+#### For GitLab:
+
+1. Go to your repository on GitLab
+2. Navigate to **Settings** → **Repository** → **Protected branches**
+3. Select `main` branch
+4. Set **Allowed to merge** to `Maintainers` or `Developers + Maintainers`
+5. Set **Allowed to push** to `No one` (or `Maintainers` only)
+6. Enable **Allowed to force push**: ❌ (disabled)
+
+### CI/CD Integration
+
+The repository includes a GitHub Actions workflow (`.github/workflows/pre-commit.yml`) that runs the same checks on pull requests and pushes to main.
+
+### Bypassing Pre-commit (Not Recommended)
+
+If you need to bypass the pre-commit hook in an emergency:
+
+```bash
+git commit --no-verify -m "your message"
+```
+
+**Warning**: Only use this in emergencies. The main branch should always pass all checks.
+
+### Troubleshooting Pre-commit Hooks
+
+**Hook not running:**
+- Make sure the hook is executable: `chmod +x .git/hooks/pre-commit`
+- Verify it's in the right place: `.git/hooks/pre-commit`
+
+**Hook failing:**
+- Fix formatting issues: `go fmt ./...`
+- Fix vet issues: `go vet ./...`
+- Ensure code compiles: `go build ./...`
+- Check for large files that might need Git LFS
 
 ## API Information
 

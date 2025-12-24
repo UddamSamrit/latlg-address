@@ -183,6 +183,17 @@ The pre-commit hook automatically runs before each commit and checks:
 
 If any check fails, the commit will be blocked. Fix the issues and try again.
 
+#### What the Pre-push Hook Checks
+
+The pre-push hook automatically runs before each push and verifies:
+
+- ✅ **Code Formatting**: Runs `go fmt` to ensure code is properly formatted
+- ✅ **Static Analysis**: Runs `go vet` to catch common errors
+- ✅ **Compilation**: Ensures the code compiles successfully
+- ⚠️ **Uncommitted Changes**: Warns if you have uncommitted changes
+
+If any check fails, the push will be blocked. Fix the issues and try again.
+
 ### Protecting the Main Branch
 
 #### For GitHub:
@@ -223,17 +234,22 @@ git commit --no-verify -m "your message"
 
 **Warning**: Only use this in emergencies. The main branch should always pass all checks.
 
-### Troubleshooting Pre-commit Hooks
+### Troubleshooting Pre-commit and Pre-push Hooks
 
 **Hook not running:**
-- Make sure the hook is executable: `chmod +x .git/hooks/pre-commit`
-- Verify it's in the right place: `.git/hooks/pre-commit`
+- Make sure hooks are executable: `chmod +x .git/hooks/pre-commit .git/hooks/pre-push`
+- Verify they're in the right place: `.git/hooks/pre-commit` and `.git/hooks/pre-push`
+- Re-run setup: `./setup-hooks.sh`
 
 **Hook failing:**
 - Fix formatting issues: `go fmt ./...`
 - Fix vet issues: `go vet ./...`
 - Ensure code compiles: `go build ./...`
 - Check for large files that might need Git LFS
+
+**Bypassing hooks (Not Recommended):**
+- Pre-commit: `git commit --no-verify -m "message"`
+- Pre-push: `git push --no-verify`
 
 ## 100% Setup Verification
 

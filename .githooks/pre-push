@@ -1,0 +1,44 @@
+#!/bin/bash
+
+# Pre-push hook to verify code quality before pushing
+
+set -e
+
+echo "Running pre-push verification..."
+
+# Check if Go is installed
+if ! command -v go &> /dev/null; then
+    echo "Error: Go is not installed or not in PATH"
+    exit 1
+fi
+
+# Run go fmt to check formatting
+echo "Checking code formatting..."
+if ! go fmt ./...; then
+    echo "Error: Code formatting failed"
+    exit 1
+fi
+
+# Run go vet to check for errors
+echo "Running go vet..."
+if ! go vet ./...; then
+    echo "Error: go vet found issues"
+    exit 1
+fi
+
+# Check if code compiles
+echo "Verifying code compiles..."
+if ! go build ./...; then
+    echo "Error: Code does not compile"
+    exit 1
+fi
+
+# Check for uncommitted changes (optional)
+if [ -n "$(git status --porcelain)" ]; then
+    echo "Warning: You have uncommitted changes"
+    echo "Consider committing or stashing them before pushing"
+fi
+
+echo "✓ Pre-push verification passed!"
+exit 0
+

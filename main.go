@@ -113,13 +113,15 @@ func (r *Repository) SetCellValue(cell string, value interface{}) error {
 
 // Service handles business logic for coordinate to address conversion
 type Service struct {
-	repo *Repository
+	repo  *Repository
+	cache *coordinateCache
 }
 
 // NewService creates a new service instance
 func NewService(repo *Repository) *Service {
 	return &Service{
-		repo: repo,
+		repo:  repo,
+		cache: newCoordinateCache(),
 	}
 }
 
@@ -128,6 +130,9 @@ func (s *Service) Process(excelFile string) error {
 	fmt.Printf("Processing sheet: %s\n", s.repo.GetSheetName())
 
 	rows := s.repo.GetRows()
+	totalRows := len(rows) - 1 // Exclude header
+	fmt.Printf("Total rows to process: %d\n", totalRows)
+
 	latLngCol, addressCol, districtCol, provinceCol, err := s.findColumns(rows)
 	if err != nil {
 		return err
@@ -137,7 +142,16 @@ func (s *Service) Process(excelFile string) error {
 		addressCol, districtCol, provinceCol = s.addAddressColumns(len(rows[0]))
 	}
 
-	processed := s.processRows(rows, latLngCol, addressCol, districtCol, provinceCol)
+	// For large datasets (>100k rows), process in batches and save periodically
+	batchSize := 1000
+	if totalRows > 100000 {
+		fmt.Printf("Large dataset detected. Processing in batches of %d rows...\n", batchSize)
+		processed := s.processRowsInBatches(rows, latLngCol, addressCol, districtCol, provinceCol, batchSize, excelFile)
+		fmt.Printf("\n✓ Processed %d rows\n", processed)
+	} else {
+		processed := s.processRows(rows, latLngCol, addressCol, districtCol, provinceCol)
+		fmt.Printf("\n✓ Processed %d rows\n", processed)
+	}
 
 	// Save to data/ directory
 	dataDir := "data"
@@ -151,9 +165,172 @@ func (s *Service) Process(excelFile string) error {
 		return fmt.Errorf("saving file: %w", err)
 	}
 
-	fmt.Printf("\n✓ Processed %d rows\n", processed)
 	fmt.Printf("✓ Output saved to: %s\n", outputFile)
 	return nil
+}
+
+// processRowsInBatches processes rows in batches for large datasets
+func (s *Service) processRowsInBatches(rows [][]string, latLngCol, addressCol, districtCol, provinceCol, batchSize int, excelFile string) int {
+	totalRows := len(rows) - 1
+	totalBatches := (totalRows + batchSize - 1) / batchSize
+	processed := 0
+
+	for batch := 0; batch < totalBatches; batch++ {
+		start := batch*batchSize + 1 // +1 to skip header
+		end := start + batchSize
+		if end > len(rows) {
+			end = len(rows)
+		}
+
+		fmt.Printf("\n--- Processing batch %d/%d (rows %d-%d) ---\n", batch+1, totalBatches, start, end-1)
+
+		// Process this batch
+		batchRows := rows[start:end]
+		// Adjust row indices for batch processing
+		batchProcessed := s.processBatch(batchRows, start-1, latLngCol, addressCol, districtCol, provinceCol)
+		processed += batchProcessed
+
+		// Save progress after each batch
+		dataDir := "data"
+		fileName := filepath.Base(excelFile)
+		tempFile := filepath.Join(dataDir, strings.TrimSuffix(fileName, ".xlsx")+"_temp.xlsx")
+		if err := s.repo.SaveAs(tempFile); err != nil {
+			fmt.Printf("Warning: Could not save progress: %v\n", err)
+		} else {
+			fmt.Printf("Progress saved: %d/%d rows processed (%.1f%%)\n", processed, totalRows, float64(processed)/float64(totalRows)*100)
+		}
+
+		// Small delay between batches to be respectful
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	return processed
+}
+
+// processBatch processes a batch of rows
+func (s *Service) processBatch(batchRows [][]string, startIndex, latLngCol, addressCol, districtCol, provinceCol int) int {
+	numWorkers := 10
+	requestDelay := 1500 * time.Millisecond
+
+	jobs := make(chan int, len(batchRows))
+	results := make(chan rowResult, len(batchRows))
+	var wg sync.WaitGroup
+
+	// Start workers
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for batchIdx := range jobs {
+				rowIndex := startIndex + batchIdx
+				row := batchRows[batchIdx]
+
+				// Ensure row has enough columns
+				maxCol := latLngCol
+				if addressCol > maxCol {
+					maxCol = addressCol
+				}
+				if districtCol > maxCol {
+					maxCol = districtCol
+				}
+				if provinceCol > maxCol {
+					maxCol = provinceCol
+				}
+				for len(row) <= maxCol {
+					row = append(row, "")
+				}
+
+				coordStr := strings.TrimSpace(row[latLngCol])
+				if coordStr == "" {
+					results <- rowResult{rowIndex: rowIndex, skipped: true, message: "empty coordinates"}
+					continue
+				}
+
+				coords, err := s.parseCoordinates(coordStr)
+				if err != nil {
+					results <- rowResult{rowIndex: rowIndex, skipped: true, message: err.Error()}
+					continue
+				}
+
+				// Check cache first (for duplicate coordinates)
+				address, district, province, cached := s.cache.get(coords.Lat, coords.Lng)
+				if !cached {
+					// Rate limiting per worker
+					time.Sleep(requestDelay)
+
+					address, district, province, err = s.reverseGeocode(coords.Lat, coords.Lng)
+					if err != nil {
+						results <- rowResult{
+							rowIndex: rowIndex,
+							skipped:  true,
+							message:  fmt.Sprintf("geocode error: %v", err),
+						}
+						continue
+					}
+
+					// Cache the result
+					s.cache.set(coords.Lat, coords.Lng, address, district, province)
+				}
+
+				results <- rowResult{
+					rowIndex: rowIndex,
+					address:  address,
+					district: district,
+					province: province,
+					coords:   coords,
+				}
+			}
+		}(w)
+	}
+
+	// Send jobs
+	go func() {
+		for i := 0; i < len(batchRows); i++ {
+			jobs <- i
+		}
+		close(jobs)
+	}()
+
+	// Close results channel when all workers are done
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	// Process results
+	batchProcessed := 0
+	for result := range results {
+		rowNum := result.rowIndex + 1
+
+		if result.skipped {
+			if rowNum%100 == 0 || strings.Contains(result.message, "rate limit") {
+				fmt.Printf("Row %d: %s\n", rowNum, result.message)
+			}
+			continue
+		}
+
+		// Write full address
+		colName, _ := excelize.ColumnNumberToName(addressCol + 1)
+		cell := fmt.Sprintf("%s%d", colName, rowNum)
+		s.repo.SetCellValue(cell, result.address)
+
+		// Write district
+		colName, _ = excelize.ColumnNumberToName(districtCol + 1)
+		cell = fmt.Sprintf("%s%d", colName, rowNum)
+		s.repo.SetCellValue(cell, result.district)
+
+		// Write province
+		colName, _ = excelize.ColumnNumberToName(provinceCol + 1)
+		cell = fmt.Sprintf("%s%d", colName, rowNum)
+		s.repo.SetCellValue(cell, result.province)
+
+		batchProcessed++
+		if batchProcessed%100 == 0 {
+			fmt.Printf("  Processed %d rows in this batch...\n", batchProcessed)
+		}
+	}
+
+	return batchProcessed
 }
 
 // findColumns finds the latitude/longitude, address, district, and province columns
@@ -265,6 +442,46 @@ type rowResult struct {
 	coords   Coordinates
 }
 
+// coordinateCache caches geocoding results to avoid duplicate API calls
+type coordinateCache struct {
+	mu    sync.RWMutex
+	cache map[string]cacheEntry
+}
+
+type cacheEntry struct {
+	address  string
+	district string
+	province string
+}
+
+func newCoordinateCache() *coordinateCache {
+	return &coordinateCache{
+		cache: make(map[string]cacheEntry),
+	}
+}
+
+func (c *coordinateCache) get(lat, lng float64) (address, district, province string, found bool) {
+	key := fmt.Sprintf("%.6f,%.6f", lat, lng)
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	entry, exists := c.cache[key]
+	if exists {
+		return entry.address, entry.district, entry.province, true
+	}
+	return "", "", "", false
+}
+
+func (c *coordinateCache) set(lat, lng float64, address, district, province string) {
+	key := fmt.Sprintf("%.6f,%.6f", lat, lng)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.cache[key] = cacheEntry{
+		address:  address,
+		district: district,
+		province: province,
+	}
+}
+
 // processRows processes all data rows and converts coordinates to addresses concurrently
 func (s *Service) processRows(rows [][]string, latLngCol, addressCol, districtCol, provinceCol int) int {
 	// Number of concurrent workers (10 workers for faster processing)
@@ -312,17 +529,24 @@ func (s *Service) processRows(rows [][]string, latLngCol, addressCol, districtCo
 					continue
 				}
 
-				// Rate limiting per worker
-				time.Sleep(requestDelay)
+				// Check cache first (for duplicate coordinates)
+				address, district, province, cached := s.cache.get(coords.Lat, coords.Lng)
+				if !cached {
+					// Rate limiting per worker
+					time.Sleep(requestDelay)
 
-				address, district, province, err := s.reverseGeocode(coords.Lat, coords.Lng)
-				if err != nil {
-					results <- rowResult{
-						rowIndex: rowIndex,
-						skipped:  true,
-						message:  fmt.Sprintf("geocode error: %v", err),
+					address, district, province, err = s.reverseGeocode(coords.Lat, coords.Lng)
+					if err != nil {
+						results <- rowResult{
+							rowIndex: rowIndex,
+							skipped:  true,
+							message:  fmt.Sprintf("geocode error: %v", err),
+						}
+						continue
 					}
-					continue
+
+					// Cache the result
+					s.cache.set(coords.Lat, coords.Lng, address, district, province)
 				}
 
 				results <- rowResult{

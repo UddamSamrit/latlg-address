@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/xuri/excelize/v2"
@@ -253,68 +254,133 @@ func (s *Service) parseCoordinates(coordStr string) (Coordinates, error) {
 	return Coordinates{Lat: lat, Lng: lng}, nil
 }
 
-// processRows processes all data rows and converts coordinates to addresses
+// rowResult holds the result of processing a row
+type rowResult struct {
+	rowIndex int
+	skipped  bool
+	message  string
+	address  string
+	district string
+	province string
+	coords   Coordinates
+}
+
+// processRows processes all data rows and converts coordinates to addresses concurrently
 func (s *Service) processRows(rows [][]string, latLngCol, addressCol, districtCol, provinceCol int) int {
+	// Number of concurrent workers (10 workers for faster processing)
+	numWorkers := 10
+	// Rate limiting: delay between requests per worker (1.5 seconds per worker)
+	requestDelay := 1500 * time.Millisecond
+
+	// Channel for jobs
+	jobs := make(chan int, len(rows))
+	results := make(chan rowResult, len(rows))
+	var wg sync.WaitGroup
+
+	// Start workers
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for rowIndex := range jobs {
+				row := rows[rowIndex]
+
+				// Ensure row has enough columns
+				maxCol := latLngCol
+				if addressCol > maxCol {
+					maxCol = addressCol
+				}
+				if districtCol > maxCol {
+					maxCol = districtCol
+				}
+				if provinceCol > maxCol {
+					maxCol = provinceCol
+				}
+				for len(row) <= maxCol {
+					row = append(row, "")
+				}
+
+				coordStr := strings.TrimSpace(row[latLngCol])
+				if coordStr == "" {
+					results <- rowResult{rowIndex: rowIndex, skipped: true, message: "empty coordinates"}
+					continue
+				}
+
+				coords, err := s.parseCoordinates(coordStr)
+				if err != nil {
+					results <- rowResult{rowIndex: rowIndex, skipped: true, message: err.Error()}
+					continue
+				}
+
+				// Rate limiting per worker
+				time.Sleep(requestDelay)
+
+				address, district, province, err := s.reverseGeocode(coords.Lat, coords.Lng)
+				if err != nil {
+					results <- rowResult{
+						rowIndex: rowIndex,
+						skipped:  true,
+						message:  fmt.Sprintf("geocode error: %v", err),
+					}
+					continue
+				}
+
+				results <- rowResult{
+					rowIndex: rowIndex,
+					address:  address,
+					district: district,
+					province: province,
+					coords:   coords,
+				}
+			}
+		}(w)
+	}
+
+	// Send jobs
+	go func() {
+		for i := 1; i < len(rows); i++ {
+			jobs <- i
+		}
+		close(jobs)
+	}()
+
+	// Close results channel when all workers are done
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	// Process results
 	processed := 0
+	completed := 0
+	total := len(rows) - 1
 
-	for i := 1; i < len(rows); i++ {
-		row := rows[i]
+	for result := range results {
+		completed++
+		rowNum := result.rowIndex + 1
 
-		// Ensure row has enough columns
-		maxCol := latLngCol
-		if addressCol > maxCol {
-			maxCol = addressCol
-		}
-		if districtCol > maxCol {
-			maxCol = districtCol
-		}
-		if provinceCol > maxCol {
-			maxCol = provinceCol
-		}
-		for len(row) <= maxCol {
-			row = append(row, "")
-		}
-
-		coordStr := strings.TrimSpace(row[latLngCol])
-		if coordStr == "" {
-			fmt.Printf("Row %d: Skipping empty coordinates\n", i+1)
-			continue
-		}
-
-		coords, err := s.parseCoordinates(coordStr)
-		if err != nil {
-			fmt.Printf("Row %d: %v\n", i+1, err)
-			continue
-		}
-
-		fmt.Printf("Row %d: Processing coordinates (%.6f, %.6f)... ", i+1, coords.Lat, coords.Lng)
-
-		address, district, province, err := s.reverseGeocode(coords.Lat, coords.Lng)
-		if err != nil {
-			fmt.Printf("Error: %v\n", err)
+		if result.skipped {
+			fmt.Printf("Row %d: %s\n", rowNum, result.message)
 			continue
 		}
 
 		// Write full address
 		colName, _ := excelize.ColumnNumberToName(addressCol + 1)
-		cell := fmt.Sprintf("%s%d", colName, i+1)
-		s.repo.SetCellValue(cell, address)
+		cell := fmt.Sprintf("%s%d", colName, rowNum)
+		s.repo.SetCellValue(cell, result.address)
 
 		// Write district
 		colName, _ = excelize.ColumnNumberToName(districtCol + 1)
-		cell = fmt.Sprintf("%s%d", colName, i+1)
-		s.repo.SetCellValue(cell, district)
+		cell = fmt.Sprintf("%s%d", colName, rowNum)
+		s.repo.SetCellValue(cell, result.district)
 
 		// Write province
 		colName, _ = excelize.ColumnNumberToName(provinceCol + 1)
-		cell = fmt.Sprintf("%s%d", colName, i+1)
-		s.repo.SetCellValue(cell, province)
+		cell = fmt.Sprintf("%s%d", colName, rowNum)
+		s.repo.SetCellValue(cell, result.province)
 
-		fmt.Printf("✓ Address: %s\n", address)
+		fmt.Printf("Row %d: ✓ [%d/%d] (%.6f, %.6f) -> %s\n", rowNum, completed, total, result.coords.Lat, result.coords.Lng, result.address)
 		processed++
-
-		// Be respectful to the API - add delay between requests
-		time.Sleep(1 * time.Second)
 	}
 
 	return processed
@@ -322,55 +388,93 @@ func (s *Service) processRows(rows [][]string, latLngCol, addressCol, districtCo
 
 // reverseGeocode converts latitude and longitude to full address, district, and province using Nominatim API
 func (s *Service) reverseGeocode(lat, lng float64) (address, district, province string, err error) {
-	// Using OpenStreetMap Nominatim API (free, no API key required)
-	baseURL := "https://nominatim.openstreetmap.org/reverse"
+	maxRetries := 3
+	baseDelay := 2 * time.Second
 
-	params := url.Values{}
-	params.Set("lat", fmt.Sprintf("%.6f", lat))
-	params.Set("lon", fmt.Sprintf("%.6f", lng))
-	params.Set("format", "json")
-	params.Set("addressdetails", "1")
-	params.Set("accept-language", "en") // Request English language
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if attempt > 0 {
+			// Exponential backoff: 2s, 4s, 8s
+			delay := baseDelay * time.Duration(1<<uint(attempt-1))
+			time.Sleep(delay)
+		}
 
-	reqURL := fmt.Sprintf("%s?%s", baseURL, params.Encode())
+		// Using OpenStreetMap Nominatim API (free, no API key required)
+		baseURL := "https://nominatim.openstreetmap.org/reverse"
 
-	// Create HTTP request with proper headers (required by Nominatim)
-	req, err := http.NewRequest("GET", reqURL, nil)
-	if err != nil {
-		return "", "", "", err
+		params := url.Values{}
+		params.Set("lat", fmt.Sprintf("%.6f", lat))
+		params.Set("lon", fmt.Sprintf("%.6f", lng))
+		params.Set("format", "json")
+		params.Set("addressdetails", "1")
+		params.Set("accept-language", "en") // Request English language
+
+		reqURL := fmt.Sprintf("%s?%s", baseURL, params.Encode())
+
+		// Create HTTP request with proper headers (required by Nominatim)
+		req, err := http.NewRequest("GET", reqURL, nil)
+		if err != nil {
+			return "", "", "", err
+		}
+
+		// Better User-Agent identification (required by Nominatim policy)
+		req.Header.Set("User-Agent", "latlg-address-converter/1.0")
+		req.Header.Set("Accept-Language", "en")
+		req.Header.Set("Referer", "https://github.com")
+
+		client := &http.Client{
+			Timeout: 15 * time.Second,
+		}
+
+		resp, err := client.Do(req)
+		if err != nil {
+			if attempt < maxRetries-1 {
+				continue // Retry on network errors
+			}
+			return "", "", "", err
+		}
+
+		// Handle rate limiting (429) with retry
+		if resp.StatusCode == 429 {
+			resp.Body.Close()
+			if attempt < maxRetries-1 {
+				// Wait longer for rate limit
+				waitTime := time.Duration(attempt+1) * 10 * time.Second
+				time.Sleep(waitTime)
+				continue
+			}
+			return "", "", "", fmt.Errorf("API rate limit exceeded after %d retries", maxRetries)
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if attempt < maxRetries-1 && resp.StatusCode >= 500 {
+				continue // Retry on server errors
+			}
+			return "", "", "", fmt.Errorf("API returned status %d: %s", resp.StatusCode, string(body))
+		}
+
+		var geocodeResp GeocodeResponse
+		if err := json.NewDecoder(resp.Body).Decode(&geocodeResp); err != nil {
+			resp.Body.Close()
+			if attempt < maxRetries-1 {
+				continue // Retry on decode errors
+			}
+			return "", "", "", err
+		}
+		resp.Body.Close()
+
+		if geocodeResp.DisplayName == "" {
+			return "", "", "", fmt.Errorf("no address found for coordinates")
+		}
+
+		// Format full address and extract district and province
+		address = s.formatFullAddress(geocodeResp)
+		district, province = s.extractDistrictAndProvince(geocodeResp)
+		return address, district, province, nil
 	}
 
-	req.Header.Set("User-Agent", "latlg-address-converter/1.0")
-	req.Header.Set("Accept-Language", "en") // Request English language
-
-	client := &http.Client{
-		Timeout: 10 * time.Second,
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", "", "", err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return "", "", "", fmt.Errorf("API returned status %d: %s", resp.StatusCode, string(body))
-	}
-
-	var geocodeResp GeocodeResponse
-	if err := json.NewDecoder(resp.Body).Decode(&geocodeResp); err != nil {
-		return "", "", "", err
-	}
-
-	if geocodeResp.DisplayName == "" {
-		return "", "", "", fmt.Errorf("no address found for coordinates")
-	}
-
-	// Format full address and extract district and province
-	address = s.formatFullAddress(geocodeResp)
-	district, province = s.extractDistrictAndProvince(geocodeResp)
-	return address, district, province, nil
+	return "", "", "", fmt.Errorf("failed after %d retries", maxRetries)
 }
 
 // formatFullAddress formats the complete address in English
